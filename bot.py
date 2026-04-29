@@ -1,7 +1,7 @@
 """
 MaxMusicBot — Multi-language Music Bot (UZ, RU, EN)
 Style: VKM Bot
-Features: Music Search, YouTube Download, Stars Payment
+Features: Music Search, YouTube Download, Stars Payment, Admin Panel
 """
 
 import os
@@ -13,7 +13,7 @@ import aiohttp
 from urllib.parse import quote
 from telegram import (
     Update, LabeledPrice, InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton, WebAppInfo
+    ReplyKeyboardMarkup, KeyboardButton
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters, ContextTypes,
@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 #  Config
 # ─────────────────────────────────────────────────────────────
 BOT_TOKEN      = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
+ADMIN_ID       = int(os.getenv("ADMIN_ID", "0"))  # O'zingizning ID'ingizni .env ga yozing
 TEMP_DIR       = "temp_downloads"
 USER_DATA_DB   = "users_data.json"
 PREMIUM_PRICE  = 100   # Stars
@@ -48,7 +49,7 @@ def load_data():
     if os.path.exists(USER_DATA_DB):
         with open(USER_DATA_DB, "r") as f:
             return json.load(f)
-    return {"premium": [], "languages": {}}
+    return {"premium": [], "languages": {}, "users": []}
 
 def save_data(data):
     with open(USER_DATA_DB, "w") as f:
@@ -61,6 +62,13 @@ def get_lang(user_id):
 
 def is_premium(user_id):
     return user_id in DATA["premium"]
+
+def add_user(user):
+    if user.id not in DATA["users"]:
+        DATA["users"].append(user.id)
+        save_data(DATA)
+        return True
+    return False
 
 # ─────────────────────────────────────────────────────────────
 #  Localization Strings
@@ -156,13 +164,22 @@ def lang_keyboard():
 def main_reply_keyboard(user_id):
     lang = get_lang(user_id)
     btn_text = STRINGS[lang]["premium_btn"] if not is_premium(user_id) else STRINGS[lang]["premium_info"]
-    return ReplyKeyboardMarkup(
-        [[KeyboardButton(btn_text)]],
-        resize_keyboard=True
-    )
+    keyboard = [[KeyboardButton(btn_text)]]
+    
+    # Admin bo'lsa, Admin Panel tugmasini qo'shish
+    if user_id == ADMIN_ID:
+        keyboard.append([KeyboardButton("📊 Admin Panel")])
+        
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def admin_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📈 Statistika", callback_data="admin_stats")],
+        [InlineKeyboardButton("📢 Reklama yuborish", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("👤 Foydalanuvchilar", callback_data="admin_users_list")]
+    ])
 
 def vkm_style_keyboard(results):
-    # Create buttons 1-N based on results
     buttons = []
     row = []
     for i in range(len(results)):
@@ -190,7 +207,20 @@ async def search_music(query):
 #  Handlers
 # ─────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user = update.effective_user
+    user_id = user.id
+    
+    # Yangi user bo'lsa adminga xabar berish
+    is_new = add_user(user)
+    if is_new and ADMIN_ID != 0:
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"🆕 **Yangi foydalanuvchi!**\n👤 Ism: {user.first_name}\n🆔 ID: `{user_id}`\n🔗 Username: @{user.username or 'yoq'}",
+                parse_mode="Markdown"
+            )
+        except: pass
+
     if str(user_id) not in DATA["languages"]:
         await update.message.reply_text(STRINGS["ru"]["select_lang"], reply_markup=lang_keyboard())
     else:
@@ -200,27 +230,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=main_reply_keyboard(user_id)
         )
 
-async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    lang_code = query.data.split("_")[1]
-    user_id = query.from_user.id
-    
-    DATA["languages"][str(user_id)] = lang_code
-    save_data(DATA)
-    
-    await query.answer()
-    await query.message.delete()
-    await context.bot.send_message(
-        chat_id=user_id,
-        text=STRINGS[lang_code]["welcome"],
-        reply_markup=main_reply_keyboard(user_id)
-    )
-
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    user_id = update.effective_user.id
+    user = update.effective_user
+    user_id = user.id
     lang = get_lang(user_id)
     
+    # Admin Panel Check
+    if text == "📊 Admin Panel" and user_id == ADMIN_ID:
+        await update.message.reply_text("🛠 **Admin Panelga xush kelibsiz!**", reply_markup=admin_keyboard(), parse_mode="Markdown")
+        return
+
     # Premium Button Check
     if "Premium" in text or "💎" in text:
         if is_premium(user_id):
@@ -263,6 +283,64 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=vkm_style_keyboard(results)
     )
 
+async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    user_id = query.from_user.id
+    lang = get_lang(user_id)
+    
+    await query.answer()
+    
+    if data.startswith("setlang_"):
+        lang_code = data.split("_")[1]
+        DATA["languages"][str(user_id)] = lang_code
+        save_data(DATA)
+        await query.message.delete()
+        await context.bot.send_message(chat_id=user_id, text=STRINGS[lang_code]["welcome"], reply_markup=main_reply_keyboard(user_id))
+    
+    elif data.startswith("track_"):
+        idx = int(data.split("_")[1])
+        results = context.user_data.get("last_results", [])
+        if idx < len(results):
+            track = results[idx]
+            preview = track.get("previewUrl")
+            artist = track.get("artistName")
+            title = track.get("trackName")
+            await query.message.reply_audio(audio=preview, title=title, performer=artist, caption=f"🎵 {artist} - {title}\n\n@MaxMusicBot")
+            
+    # Admin Actions
+    elif data == "admin_stats" and user_id == ADMIN_ID:
+        total_users = len(DATA["users"])
+        premium_users = len(DATA["premium"])
+        await query.message.edit_text(f"📈 **Bot Statistikasi:**\n\n👥 Jami foydalanuvchilar: {total_users}\n💎 Premium foydalanuvchilar: {premium_users}", parse_mode="Markdown", reply_markup=admin_keyboard())
+        
+    elif data == "admin_broadcast" and user_id == ADMIN_ID:
+        await query.message.reply_text("📝 **Reklama xabarini yuboring.**\nBarcha foydalanuvchilarga yuboriladi.")
+        context.user_data["admin_state"] = "waiting_broadcast"
+
+    elif data == "admin_users_list" and user_id == ADMIN_ID:
+        users_text = "👤 **Oxirgi foydalanuvchilar (ID):**\n" + "\n".join([str(uid) for uid in DATA["users"][-10:]])
+        await query.message.edit_text(users_text, reply_markup=admin_keyboard())
+
+# ─────────────────────────────────────────────────────────────
+#  Broadcast Logic
+# ─────────────────────────────────────────────────────────────
+async def handle_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("admin_state") == "waiting_broadcast" and update.effective_user.id == ADMIN_ID:
+        text = update.message.text
+        count = 0
+        for uid in DATA["users"]:
+            try:
+                await context.bot.send_message(chat_id=uid, text=text)
+                count += 1
+                await asyncio.sleep(0.05) # Flood protection
+            except: pass
+        await update.message.reply_text(f"✅ Reklama {count} ta foydalanuvchiga yuborildi.")
+        context.user_data["admin_state"] = None
+
+# ─────────────────────────────────────────────────────────────
+#  Payments
+# ─────────────────────────────────────────────────────────────
 async def send_premium_invoice(update, context):
     user_id = update.effective_user.id
     lang = get_lang(user_id)
@@ -276,42 +354,8 @@ async def send_premium_invoice(update, context):
         prices=[LabeledPrice("Premium", PREMIUM_PRICE)]
     )
 
-async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    data = query.data
-    user_id = query.from_user.id
-    lang = get_lang(user_id)
-    
-    await query.answer()
-    
-    if data.startswith("setlang_"):
-        await set_language(update, context)
-    
-    elif data.startswith("track_"):
-        idx = int(data.split("_")[1])
-        results = context.user_data.get("last_results", [])
-        if idx < len(results):
-            track = results[idx]
-            preview = track.get("previewUrl")
-            artist = track.get("artistName")
-            title = track.get("trackName")
-            await query.message.reply_audio(
-                audio=preview,
-                title=title,
-                performer=artist,
-                caption=f"🎵 {artist} - {title}\n\n@MaxMusicBot"
-            )
-            
-    elif data.startswith("yt_dl_"):
-        # Simplified download logic for brevity
-        await query.message.reply_text("⏳ Processing... (yt-dlp integration active)")
-
-# ─────────────────────────────────────────────────────────────
-#  Payments
-# ─────────────────────────────────────────────────────────────
 async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.pre_checkout_query
-    await query.answer(ok=True)
+    await update.pre_checkout_query.answer(ok=True)
 
 async def success_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -319,10 +363,7 @@ async def success_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in DATA["premium"]:
         DATA["premium"].append(user_id)
         save_data(DATA)
-    await update.message.reply_text(
-        STRINGS[lang]["success_pay"],
-        reply_markup=main_reply_keyboard(user_id)
-    )
+    await update.message.reply_text(STRINGS[lang]["success_pay"], reply_markup=main_reply_keyboard(user_id))
 
 # ─────────────────────────────────────────────────────────────
 #  Main
@@ -335,8 +376,9 @@ def main():
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, success_payment))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, handle_broadcast))
     
-    logger.info("Bot started with Multi-lang and VKM style!")
+    logger.info("Bot started with Admin Panel!")
     app.run_polling()
 
 if __name__ == "__main__":
